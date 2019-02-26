@@ -30,6 +30,7 @@ use TYPO3\CMS\Core\Database\Query\Restriction\FrontendRestrictionContainer;
 use TYPO3\CMS\Core\Database\Query\Restriction\FrontendWorkspaceRestriction;
 use TYPO3\CMS\Core\Error\Http\ShortcutTargetPageNotFoundException;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
+use TYPO3\CMS\Core\Utility\MathUtility;
 use TYPO3\CMS\Core\Versioning\VersionState;
 
 /**
@@ -338,7 +339,8 @@ class PageRepository implements LoggerAwareInterface
                     $table,
                     $row,
                     $languageAspect->getContentId(),
-                    $languageAspect->getOverlayType() === $languageAspect::OVERLAYS_MIXED ? '1' : 'hideNonTranslated'
+                    $languageAspect->getOverlayType() === $languageAspect::OVERLAYS_MIXED ? '1' : 'hideNonTranslated',
+                    $languageAspect->getFallbackChain()
                 );
             }
         } catch (AspectNotFoundException $e) {
@@ -392,8 +394,11 @@ class PageRepository implements LoggerAwareInterface
             }
         }
         unset($origPage);
+        
+        $overlays = [];
         // If language UID is different from zero, do overlay:
         if ($languageUid) {
+            $languageUids = array_merge([$languageUid], $this->getLanguagesChain());
             $page_ids = [];
 
             $origPage = reset($pagesInput);
@@ -406,6 +411,7 @@ class PageRepository implements LoggerAwareInterface
                     $page_ids[] = $origPage;
                 }
             }
+            $overlays = $this->getOverlaysForLanguageUids($page_ids, $languageUids);
             // NOTE regarding the query restrictions
             // Currently the showHiddenRecords of TSFE set will allow
             // page translation records to be selected as they are
@@ -466,6 +472,103 @@ class PageRepository implements LoggerAwareInterface
         }
         return $pagesOutput;
     }
+    
+    /**
+     * Checks whether the passed (localized) page is accessible with the current language settings
+     *
+     * @param array $page
+     * @param int|null $languageUid
+     * @return bool
+     */
+    public function pageIsSuitableForLanguage(array $page, int $languageUid = null): bool
+        {
+        if ($languageUid === null) {
+            $languageUid = $this->sys_language_uid;
+        }
+
+        if ($languageUid > 0) {
+            $languageUids = array_merge([$languageUid], $this->getLanguagesChain());
+            return in_array((int)$page['sys_language_uid'], $languageUids, true);
+        }
+
+        return GeneralUtility::hideIfDefaultLanguage($page['l18n_cfg']);
+    }
+
+    /**
+     * Returns the cleaned fallback chain from the language aspect
+     *
+     * @return int[]
+     */
+    protected function getLanguagesChain(): array
+    {
+        $languageAspect = GeneralUtility::makeInstance(Context::class)->getAspect('language');
+        $languageUids = array_unique(array_filter($languageAspect->getFallbackChain(), function ($item) {
+            return MathUtility::canBeInterpretedAsInteger($item);
+        }));
+
+        return $languageUids;
+    }
+
+    /**
+     * Returns the first match of overlays for pages in the passed languages.
+     *
+     * @param array $pageUids
+     * @param array $languageUids
+     * @return array
+     */
+    protected function getOverlaysForLanguageUids(array $pageUids, array $languageUids): array
+    {
+        // Remove "0"
+        $languageUids = array_filter($languageUids);
+
+        $languageField = $GLOBALS['TCA']['pages']['ctrl']['languageField'];
+        $overlays = [];
+
+        foreach ($pageUids as $pageId) {
+            $queryBuilder = GeneralUtility::makeInstance(ConnectionPool::class)->getQueryBuilderForTable('pages');
+            $queryBuilder->setRestrictions(GeneralUtility::makeInstance(FrontendRestrictionContainer::class));
+            $result = $queryBuilder->select('*')
+                ->from('pages')
+                ->where(
+                    $queryBuilder->expr()->eq(
+                        $GLOBALS['TCA']['pages']['ctrl']['transOrigPointerField'],
+                        $queryBuilder->createNamedParameter($pageId, \PDO::PARAM_INT)
+                    ),
+                    $queryBuilder->expr()->in(
+                        $GLOBALS['TCA']['pages']['ctrl']['languageField'],
+                        $queryBuilder->createNamedParameter($languageUids, Connection::PARAM_INT_ARRAY)
+                    )
+                )
+                ->execute();
+
+            // Create a list of rows ordered by values in $languageUids
+            $orderedListByLanguages = array_flip($languageUids);
+            while ($row = $result->fetch()) {
+                $orderedListByLanguages[$row[$languageField]] = $row;
+            }
+
+            foreach ($orderedListByLanguages as $languageUid => $row) {
+                if (is_array($row)) {
+                    // Found a result for the current language id
+                    $this->versionOL('pages', $row);
+                    if (is_array($row)) {
+                        $row['_PAGES_OVERLAY'] = true;
+                        $row['_PAGES_OVERLAY_UID'] = $row['uid'];
+                        $row['_PAGES_OVERLAY_LANGUAGE'] = $languageUid;
+                        // Unset vital fields that are NOT allowed to be overlaid:
+                        unset($row['uid'], $row['pid']);
+                        $overlays[$pageId] = $row;
+
+                        // Language fallback found, stop querying further languages
+                        break;
+                    }
+                }
+            }
+            unset($orderedListByLanguages);
+        }
+
+        return $overlays;
+    }
 
     /**
      * Creates language-overlay for records in general (where translation is found
@@ -475,10 +578,11 @@ class PageRepository implements LoggerAwareInterface
      * @param array $row Record to overlay. Must contain uid, pid and $table]['ctrl']['languageField']
      * @param int $sys_language_content Pointer to the sys_language uid for content on the site.
      * @param string $OLmode Overlay mode. If "hideNonTranslated" then records without translation will not be returned  un-translated but unset (and return value is FALSE)
+     * @param array fallbackChain for translations
      * @throws \UnexpectedValueException
      * @return mixed Returns the input record, possibly overlaid with a translation.  But if $OLmode is "hideNonTranslated" then it will return FALSE if no translation is found.
      */
-    public function getRecordOverlay($table, $row, $sys_language_content, $OLmode = '')
+    public function getRecordOverlay($table, $row, $sys_language_content, $OLmode = '', $fallbackChain=[])
     {
         foreach ($GLOBALS['TYPO3_CONF_VARS']['SC_OPTIONS']['t3lib/class.t3lib_page.php']['getRecordOverlay'] ?? [] as $className) {
             $hookObject = GeneralUtility::makeInstance($className);
@@ -507,25 +611,27 @@ class PageRepository implements LoggerAwareInterface
                     $queryBuilder->setRestrictions(
                         GeneralUtility::makeInstance(FrontendRestrictionContainer::class)
                     );
-                    $olrow = $queryBuilder->select('*')
+                    $languageChain = $sys_language_content . (count($fallbackChain) ? ',' . $fallbackChain[0] : '');
+                    $query = $queryBuilder->select('*')
                         ->from($table)
                         ->where(
                             $queryBuilder->expr()->eq(
                                 'pid',
                                 $queryBuilder->createNamedParameter($row['pid'], \PDO::PARAM_INT)
                             ),
-                            $queryBuilder->expr()->eq(
+                            $queryBuilder->expr()->in(
                                 $tableControl['languageField'],
-                                $queryBuilder->createNamedParameter($sys_language_content, \PDO::PARAM_INT)
+                                $queryBuilder->createNamedParameter(GeneralUtility::intExplode(',', $languageChain), Connection::PARAM_INT_ARRAY)
                             ),
                             $queryBuilder->expr()->eq(
                                 $tableControl['transOrigPointerField'],
                                 $queryBuilder->createNamedParameter($row['uid'], \PDO::PARAM_INT)
                             )
                         )
-                        ->setMaxResults(1)
-                        ->execute()
-                        ->fetch();
+                        ->add('orderBy', 'FIELD(' . $tableControl['languageField'] . ', ' . $languageChain . ')', true)
+                        ->setMaxResults(1);
+                    $dbResource = $query->execute();
+                    $olrow = $dbResource->fetch();
 
                     $this->versionOL($table, $olrow);
                     // Merge record content by traversing all fields:
